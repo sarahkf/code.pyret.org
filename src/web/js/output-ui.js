@@ -893,7 +893,7 @@ define(["js/js-numbers","/js/share.js","trove/srcloc", "trove/error-display", "/
       // click will toggle the decimal representation of that
       // number.  Note that this feature abandons the convenience of
       // publishing output via the CodeMirror textarea.
-      if (jsnums.isExact(num) && !jsnums.isInteger(num)) {
+      if (jsnums.isRational(num) && !jsnums.isInteger(num)) {
         // This function returns three string values, numerals to
         // appear before the decimal point, numerals to appear
         // after, and numerals to be repeated.
@@ -923,7 +923,6 @@ define(["js/js-numbers","/js/share.js","trove/srcloc", "trove/error-display", "/
       var echo = $("<span>").addClass("replTextOutput");
       echo.text(renderers.__proto__[valType](val));
       setTimeout(function() {
-        //CodeMirror.runMode(echo.text(), "pyret", echo);
         echo.addClass("cm-s-default");
       }, 0);
       return echo;
