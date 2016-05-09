@@ -250,16 +250,14 @@ define(["js/ffi-helpers", "js/runtime-util", "trove/image-lib", "./check-ui.js",
         });
         animationDiv.append(dom);
       });
-    runtime.setParam("d3-port", function(dom, width, height, onExit) {
+    runtime.setParam("d3-port", function(dom, width, height, onExit, closeButton) {
         animationDiv = $("<div>").css({"z-index": 10000});
         output.append(animationDiv);
         function onClose() {
-          Jsworld.shutdown({ cleanShutdown: true });
           onExit();
           showPrompt();
         }
         animationDiv.dialog({
-          title: 'big-bang',
           position: ["left", "top"],
 			    bgiframe : true,
 			    modal : true,
@@ -270,11 +268,14 @@ define(["js/ffi-helpers", "js/runtime-util", "trove/image-lib", "./check-ui.js",
           close : onClose,
           closeOnEscape : true
         });
+        animationDiv.parent().find('.ui-dialog-titlebar').css({display: 'none'});
+        closeButton(function() {
+          animationDiv.dialog('close');
+        });
         animationDiv.append(dom);
       });
     runtime.setParam("remove-d3-port", function() {
       closeAnimationIfOpen();
-      Jsworld.shutdown({ cleanShutdown: true });
       showPrompt();
     })
 
