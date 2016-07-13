@@ -11,10 +11,11 @@
   ],
   provides: {},
   nativeRequires: [
+    "pyret-base/js/runtime-util",
     "pyret-base/js/js-numbers",
     "cpo/share"
   ],
-  theModule: function(runtime, _, uri, parsePyret, errordisplayLib, srclocLib, image, jsnums, share) {
+  theModule: function(runtime, _, uri, parsePyret, errordisplayLib, srclocLib, image, util, jsnums, share) {
 
     srcloc = runtime.getField(srclocLib, "values");
     ED = runtime.getField(errordisplayLib, "values");
@@ -23,6 +24,44 @@
     // TODO(joe Aug 18 2014) versioning on shared modules?  Use this file's
     // version or something else?
     var shareAPI = makeShareAPI("");
+
+    var marksByEditor = {}; // Map from editor-source to {mark-span, callback}
+    function addMark(source, editor, from, to, opts, cb) {
+      if (!marksByEditor[source])
+        marksByEditor[source] = [];
+      if (editor === undefined) {
+        console.trace();
+        console.error("Editor is undefined ", source, from, to, opts, cb);
+      }
+      marksByEditor[source].push({editor: editor, from: from, to: to, opts: opts, cb: cb});
+    }
+
+    function runMarks() {
+      var allMarks = marksByEditor;
+      var chunkSize = 100;
+      marksByEditor = {};
+      for (var source in allMarks) {
+        var marks = allMarks[source];
+        var editor = marks[0].editor; // these should be uniformly the same editor...
+        for (var i = 0; i < Math.ceil(marks.length / chunkSize); i++) {
+          function chunk(start, editor, marks) {
+            return function() {
+              editor.operation(function() {
+                for (var j = start; j < marks.length && j < start + chunkSize; j++) {
+                  //...but we'll use the right editor, just in case
+                  var mark = marks[j];
+                  var handle = mark.editor.markText(mark.from, mark.to, mark.opts);
+                  if (mark.cb)
+                    mark.cb(mark.editor, handle);
+                }
+              });
+            };
+          }
+          util.suspend(chunk(i * chunkSize, editor, marks));
+        }
+      }
+    }
+
 
     function mapK(inList, f, k, outList) {
       if (inList.length === 0) { k(outList || []); }
@@ -81,15 +120,15 @@
       });
     }
 
-    function getLastUserLocation(runtime, srcloc, e, ix) {
+    function getLastUserLocation(runtime, srcloc, editors, e, ix, local) {
       var srclocStack = e.map(runtime.makeSrcloc);
       var isSrcloc = function(s) { return runtime.unwrap(runtime.getField(srcloc, "is-srcloc").app(s)); }
       var userLocs = srclocStack.filter(function(l) {
         if(!(l && isSrcloc(l))) { return false; }
         var source = runtime.getField(l, "source");
-        return (source === "definitions://"
+        return source === "definitions://"
                 || source.indexOf("interactions://") !== -1
-                || source.indexOf("gdrive") !== -1);
+                || (!local ? source.indexOf("gdrive") !== -1 : false);
       });
       var probablyErrorLocation = userLocs[ix];
       return probablyErrorLocation;
@@ -250,7 +289,7 @@
               }
             }
           });
-        }, withMarker);
+        }, withMarker, "highlightSrcloc");
       }
 
       // There are warnings to show indicating whether the check output
@@ -483,14 +522,9 @@
         var srcUrl = makeMyDriveUrl(MyDriveId);
         return srcElem.attr({href: srcUrl, target: "_blank"});
       } else if(isJSImport(cmloc.source)) {
-          /* NOTE(joe): No special handling here, since it's opaque code */
+        return srcElem;
       } else {
-        // TODO: something better here.
-        var srcUrl = "https://github.com/brownplt/pyret-lang/blob/horizon/"
-                   + cmloc.source
-                   + "#L" + (cmloc.start.line + 1) + "-"
-                   + "#L" + (cmloc.end.line + 1);
-        return srcElem.attr({href: srcUrl, target: "_blank"});
+        return srcElem;
       }
     }
 
@@ -538,6 +572,7 @@
 
     function emphasizeLine(editors, cmloc) {
       var editor = editors[cmloc.source];
+      if(!editor) return;
       for(var i = cmloc.start.line; i <= cmloc.end.line; i++) {
         setTimeout(
           function(){editor.removeLineClass(this, "background", "emphasize-line");}
@@ -556,32 +591,27 @@
 
     var goldenAngle = 2.39996322972865332;
     var lastHue = 0;
-
-    function astFromText(runtime, source, filename) {
-      // TODO(joe): This isn't, and wasn't ever, stack safe
-      return runtime.unwrap(runtime.getField(PP, "surface-parse").app(source, filename));
-    }
-
-    function locToSrc(runtime, editors, srcloc) {
+    
+    function makeSrclocAvaliable(runtime, editors, srcloc) {
       return runtime.makeFunction(function(loc) {
-        var cmloc = cmPosFromSrcloc(runtime, srcloc, loc);
-        return getSourceContent(editors, cmloc, true);
+        return runtime.ffi.cases(runtime.getField(srcloc, "is-Srcloc"), "Srcloc", loc, {
+          "builtin": function(_) {
+            console.error("srclocAvaliable should not be passed a builtin source location.", srcloc);
+            return runtime.pyretFalse;
+          },
+          "srcloc": function(filename, _, _, _, _, _, _) {
+            if(editors.hasOwnProperty(filename)) {
+              return runtime.pyretTrue;
+            } else if (!!sessionStorage.getItem(filename)) {
+              return runtime.pyretTrue;
+            } else {
+              return runtime.pyretFalse;
+            }
+          }
+        });
       });
     }
-
-    function locToAST(runtime, editors, srcloc) {
-      return runtime.makeFunction(function(loc) {
-        var cmloc = cmPosFromSrcloc(runtime, srcloc, loc);
-        var source = getSourceContent(editors, cmloc, true);
-        var prelude = ""
-        var start_line = runtime.getField(loc,"start-line");
-        var start_col = runtime.getField(loc,"start-column");
-        for(var i=1; i < start_line; i++) { prelude += "\n"; }
-        for(var i=0; i < start_col; i++) { prelude += " "; }
-        return astFromText(runtime,prelude + source, cmloc.source);
-      });
-    }
-
+    
     function getSourceContent(editors, cmloc, tight) {
       if(editors.hasOwnProperty(cmloc.source)) {
         if(!tight) {
@@ -597,9 +627,7 @@
       } else {
         var source = sessionStorage.getItem(cmloc.source);
         if(!source) {
-          source = "";
-          $.ajax({url: cmloc.source.slice(3), async:false}).success(
-            function(s){source = s});
+          return undefined;
         }
         var lines = source.split("\n").slice(cmloc.start.line, cmloc.end.line + 1);
         if(tight) {
@@ -609,7 +637,55 @@
         return lines.join("\n");
       }
     }
-
+    
+    function makeMaybeLocToAST(runtime, editors, srcloc) {
+      return runtime.makeFunction(function(loc) {
+        return runtime.ffi.cases(runtime.getField(srcloc, "is-Srcloc"), "Srcloc", loc, {
+          "builtin": function(_) {
+            console.error("maybeLocToAST should not be passed a builtin source location.", loc);
+            return runtime.ffi.makeNone();
+          },
+          "srcloc": function(filename, start_line, start_col, startCh, endL, endC, endCh) {
+            var prelude = ""
+            for(var i=1; i < start_line; i++) {prelude += "\n";}
+            for(var i=0; i < start_col; i++)  {prelude += " "; }
+            var source = getSourceContent(editors, cmPosFromSrcloc(runtime, srcloc, loc), true);
+            if(source === undefined) {
+              return runtime.ffi.makeNone();
+            } else {
+              runtime.pauseStack(function(restarter) {
+                runtime.run(function(_, __) {
+                  return runtime.getField(PP, "surface-parse").app(prelude + source, filename);
+                }, runtime.namespace, {
+                  sync: false
+                }, function(result) {
+                  if(runtime.isSuccessResult(result)) {
+                    restarter.resume(runtime.ffi.makeSome(result.result.dict.block.dict.stmts.dict.first));
+                  } else {
+                    restarter.resume(runtime.ffi.makeNone());
+                  }
+                });
+              });
+            }
+          }
+        });
+      });
+    }
+    
+    function makeMaybeStackLoc(runtime, editors, srcloc, stack) {
+      return runtime.makeFunction(function(n, userFramesOnly) {
+        var probablyErrorLocation;
+        if (userFramesOnly) { probablyErrorLocation = getLastUserLocation(runtime, srcloc, editors, stack, n, false); }
+        else if (stack.length >= n) { probablyErrorLocation = runtime.makeSrcloc(stack[n]); }
+        else { probablyErrorLocation = false; }
+        if (probablyErrorLocation) {
+          return runtime.ffi.makeSome(probablyErrorLocation);
+        } else {
+          return runtime.ffi.makeNone();
+        }
+      });
+    }
+      
     function highlightSrcloc(runtime, editors, srcloc, loc, cssColor, context, underline) {
       if (underline === undefined) underline = true;
       var styles = document.getElementById("highlight-styles").sheet;
@@ -622,16 +698,13 @@
           if(editor) {
             styles.insertRule(
                   ((context === undefined) ? "" : "#main[data-highlights=" + context + "]")
-                  + " ." + locKey + " { background-color:" + cssColor +
+                   + " ." + locKey + " { " + (!!cssColor ? "background-color:" + cssColor : "") +
                   (underline ? ";border-bottom: 2px hsla(0, 0%, 0%,.5) solid" : "") + ";}",
                   styles.cssRules.length);
-              return editor.markText(
-                cmLoc.start,
-                cmLoc.end,
-               {className: locKey + " highlight", shared: true});
-          } else {
-            return null;
+            addMark(source, editor, cmLoc.start, cmLoc.end,
+                    {className: locKey + " highlight", shared: false});
           }
+          return undefined;
         }
       });
     }
@@ -665,14 +738,14 @@
         throw new Error("Cannot spotlight a location not shown in the editor.");
       var styles = document.getElementById("highlight-styles").sheet;
       var lockey = "spotlight-" + cmlocToCSSClass(cmloc);
-      var handle = editors[cmloc.source].markText(cmloc.start, cmloc.end,
-       {className: lockey,
-        inclusiveLeft: false,
-        inclusiveRight:false,
-        shared: false,
-        clearWhenEmpty: true,
-        addToHistory: false});
-      var editorSelector = (cmloc.source == "definitions"
+      addMark(cmloc.source, editors[cmloc.source], cmloc.start, cmloc.end,
+              {className: lockey,
+               inclusiveLeft: false,
+               inclusiveRight:false,
+               shared: false,
+               clearWhenEmpty: true,
+               addToHistory: false});
+      var editorSelector = (cmloc.source == "definitions://"
         ? " > div.replMain "
         : " .repl-echo ");
       styles.insertRule(
@@ -681,86 +754,113 @@
         + lockey + "){opacity:0.4;}", 0);
       styles.insertRule(
         "#main[data-highlights=" + lockey + "]"
-        + editorSelector + " span." + lockey + "{background:white!important;}", 0);
-      return {marker: handle, key: lockey};
+        + editorSelector + " span." + lockey + "{background:white!important;"
+                    + "border-top: 0.1em solid white!important;"
+                    + "border-bottom: 0.1em solid white!important; }", 0);
+      return lockey;
     }
 
-    function snippet(editors, featured){
+    function snippet(editors, featured, srcloc, ul) {
       var cmloc = featured;
       var lockey = "snippet-" + cmlocToCSSClass(cmloc);
-      var snippetWrapper = $("<div>").addClass("cm-snippet");
-      var cmSnippet = CodeMirror(snippetWrapper[0],{
-        readOnly: "nocursor",
-        disableInput: true,
-        indentUnit: 2,
-        lineWrapping: false,
-        lineNumbers: true,
-        viewportMargin: 1,
-        scrollbarStyle: "null"});
-      var endch;
-      if(cmloc.source in editors) {
-        var cmsrc = editors[featured.source];
-        var handle = cmsrc.markText(cmloc.start, cmloc.end,
-         {className: lockey,
-          inclusiveLeft: false,
-          inclusiveRight:false,
-          shared: false,
-          clearWhenEmpty: true,
-          addToHistory: false});
-        if(cmloc.source.startsWith("interactions")) {
-          cmSnippet.setOption("lineNumberFormatter",
-            function(line) {
-              return ">";
+      var snippetWrapper = $("<div>");
+      
+      if(cmloc.source in editors
+       || !!sessionStorage.getItem(cmloc.source)) {
+        snippetWrapper.addClass("cm-snippet");
+        var endch;
+        var source;
+        if (featured.source in editors) {
+          var cmsrc = editors[featured.source];
+          endch = cmsrc.getLine(cmloc.end.line).length;
+          source = cmsrc.getRange(
+            {line: cmloc.start.line, ch: 0},
+            {line: cmloc.end.line, ch: endch});
+        } else {
+          source = sessionStorage.getItem(cmloc.source)
+            .split("\n")
+            .slice(featured.start.line, featured.end.line + 1)
+            .join("\n");
+          endch = cmSnippet.getLine(cmSnippet.lastLine()).length;
+        }
+
+        var hack = $("<div>").addClass("repl"); // needed for proper CSS styling of the CM below
+        $(document.body).append(hack.append(snippetWrapper.css("position", "absolute").css("top", "-50000px")));
+        var cmSnippet = CodeMirror(snippetWrapper[0],{
+          value: source,
+          readOnly: "nocursor",
+          disableInput: true,
+          indentUnit: 2,
+          lineWrapping: false,
+          lineNumbers: true,
+          viewportMargin: 0,
+          scrollbarStyle: "null"});
+        cmSnippet.refresh(); // compute initial view
+        snippetWrapper.detach().css("position","").css("top", ""); // undo any CSS stupidity and remove
+        hack.remove(); // from document
+        
+          
+        if(cmloc.source in editors) {
+          var cmsrc = editors[featured.source];
+          addMark(
+            featured.source, cmsrc, cmloc.start, cmloc.end,
+            {className: lockey,
+             inclusiveLeft: false,
+             inclusiveRight:false,
+             shared: false,
+             clearWhenEmpty: true,
+             addToHistory: false},
+            function(cmsrc, handle) {
+              if(cmloc.source.startsWith("interactions")) {
+                cmSnippet.setOption("lineNumberFormatter",
+                                    function(line) {
+                                      return ">";
+                                    });
+              } else {
+                cmSnippet.setOption("lineNumberFormatter",
+                                    function(line) {
+                                      var handleLoc = handle.find();
+                                      return (handleLoc === undefined) ? " ": handleLoc.from.line + line;
+                                    });
+                // Refresh the gutters when a change is made to the source document
+                var refresh = function(cm, change) {
+                  cmsrc.off("change", refresh);
+                  cmSnippet.setOption("lineNumbers",false);
+                  cmSnippet.setOption("lineNumbers",true);
+                };
+                // NOTE(joe): come back to this
+                cmsrc.on("change", refresh);
+                handle.on("clear", function(){cmsrc.off("change", refresh); });
+              }
             });
         } else {
-          cmSnippet.setOption("lineNumberFormatter",
-            function(line) {
-              var handleLoc = handle.find();
-              return (handleLoc === undefined) ? " ": handleLoc.from.line + line;
-            });
+          cmSnippet.setOption("firstLineNumber", cmloc.start.line);
         }
-        // Copy relevant part of document.
-        endch = cmsrc.getLine(cmloc.end.line).length;
-        cmSnippet.getDoc().setValue(cmsrc.getRange(
-          {line: cmloc.start.line, ch: 0},
-          {line: cmloc.end.line, ch: endch}));
+        // Fade areas outside featured range
+        cmSnippet.getDoc().markText(
+          {line: 0, ch: 0},
+          {line: 0, ch: cmloc.start.ch},
+          {className: "highlight-irrelevant"});
+        cmSnippet.getDoc().markText(
+          {line: cmloc.end.line - cmloc.start.line, ch: cmloc.end.ch},
+          {line: cmloc.end.line - cmloc.start.line, ch: endch},
+          {className: "highlight-irrelevant"});
+        // render header
+        snippetWrapper.prepend(
+          $("<header>").append(drawCMloc(editors, cmloc)));
+        snippetWrapper[0].cmrefresh = function(){cmSnippet.refresh();};
+        return {wrapper: snippetWrapper.addClass("cm-future-snippet"), editor: cmSnippet, featured: featured};
       } else {
-        cmSnippet.setOption("firstLineNumber", cmloc.start.line);
-        cmSnippet.getDoc().setValue(getSourceContent(editors, cmloc, false));
-        endch = cmSnippet.getLine(cmSnippet.lastLine()).length;
+        snippetWrapper.append($("<span>").text(runtime.getField(ul, "format").app(runtime.pyretTrue)));
+        snippetWrapper[0].cmrefresh = function(){};
+        return {wrapper: snippetWrapper, featured: featured};
       }
-
-      // Fade areas outside featured range
-      cmSnippet.getDoc().markText(
-        {line: 0, ch: 0},
-        {line: 0, ch: cmloc.start.ch},
-        {className: "highlight-irrelevant"});
-      cmSnippet.getDoc().markText(
-        {line: cmloc.end.line - cmloc.start.line, ch: cmloc.end.ch},
-        {line: cmloc.end.line - cmloc.start.line, ch: endch},
-        {className: "highlight-irrelevant"});
-
-      if(cmloc.source in editors) {
-        // Refresh the gutters when a change is made to the source document
-        var refresh = function(cm, change) {
-          cmSnippet.setOption("firstLineNumber",0);
-          cmSnippet.setOption("firstLineNumber",1);};
-        cmsrc.on("change", refresh);
-        handle.on("clear", function(){cmsrc.off("change", refresh);});
-      }
-
-      // render header
-      snippetWrapper.prepend(
-        $("<header>").append(drawCMloc(editors, cmloc)));
-      snippetWrapper[0].cmrefresh = function(){cmSnippet.refresh();};
-      return {wrapper: snippetWrapper.addClass("cm-future-snippet"), editor: cmSnippet, featured: featured};
     }
 
     function renderStackTrace(runtime, editors, srcloc, error) {
       var srclocStack = error.pyretStack.map(runtime.makeSrcloc);
       var isSrcloc = function(s) { return runtime.unwrap(runtime.getField(srcloc, "is-srcloc").app(s)); }
       var userLocs = srclocStack.filter(function(l) { return l && isSrcloc(l); });
-      var snippets = new Array();
       var contextManager = document.getElementById("main").dataset;
       var currentHighlight;
       var container = $("<div>").addClass("stacktrace")
@@ -775,31 +875,58 @@
         });
       if(userLocs.length > 0) {
         container.append($("<p>").text("Evaluation in progress when the error occurred (most recent first):"));
-        userLocs.forEach(function(ul) {
-          var slContainer = $("<div>");
-          var cmLoc = cmPosFromSrcloc(runtime, srcloc, ul);
-          var cmSnippet = snippet(editors, cmLoc);
-          snippets.push(cmSnippet.editor);
-          cmSnippet.editor.getWrapperElement().style.height =
-            (cmLoc.start.line == cmLoc.end.line ? "1rem" : "1.5rem");
-          if(editors[cmLoc.source] === undefined) {
-            cmSnippet.wrapper.on("mouseenter", function(e){
-              contextManager.highlights = "spotlight-external";
-              flashMessage("This code isn't in this editor.")
-            });
-            cmSnippet.wrapper.on("mouseleave", function(e){
-              clearFlash();
-            });
-          } else {
-            var lockey = spotlight(editors, cmLoc).key;
-            cmSnippet.wrapper.on("mouseenter", function(e){
-              gotoLoc(runtime, editors, srcloc, ul);
-              contextManager.highlights = lockey;
-            });
+        function drawStackChunk(i) {
+          if (i >= userLocs.length) return;
+          var j = 0;
+          for (j = 0; j + i < userLocs.length && j < 10; j++) {
+            var ul = userLocs[j + i];
+            var slContainer = $("<div>");
+            var cmLoc = cmPosFromSrcloc(runtime, srcloc, ul);
+            var cmSnippet = snippet(editors, cmLoc, srcloc, ul);
+            if (cmSnippet.editor) {
+              cmSnippet.editor.getWrapperElement().style.height =
+                (cmLoc.start.line == cmLoc.end.line ? "1rem" : "1.5rem");
+              if(editors[cmLoc.source] === undefined) {
+                cmSnippet.wrapper.on("mouseenter", function(e){
+                  contextManager.highlights = "spotlight-external";
+                  flashMessage("This code isn't in this editor.")
+                });
+                cmSnippet.wrapper.on("mouseleave", function(e){
+                  clearFlash();
+                });
+              } else {
+                cmSnippet.wrapper.on("mouseenter",
+                                     (function(key, ul){
+                                       return function(e){
+                                         gotoLoc(runtime, editors, srcloc, ul);
+                                         contextManager.highlights = key;
+                                       };
+                                     })(spotlight(editors, cmLoc), ul));
+              }
+            } else {
+              cmSnippet.wrapper.on("mouseenter", function(e){
+                contextManager.highlights = "spotlight-external";
+                flashMessage("This code isn't in this editor.")
+              });
+              cmSnippet.wrapper.on("mouseleave", function(e){
+                clearFlash();
+              });
+            }
+            slContainer.append(cmSnippet.wrapper);
+            container.append(slContainer);
+            if(cmSnippet.editor)
+              cmSnippet.editor.refresh();
           }
-          slContainer.append(cmSnippet.wrapper);
-          container.append(slContainer);
-        });
+          if (j == 10) {
+            var more = $("<a>").text("Show more...");
+            more.on("click", function() {
+              more.remove();
+              drawStackChunk(i + 10);
+            });
+            container.append(more);
+          }
+        }
+        drawStackChunk(0);
         return expandable(container, "program execution trace");
       } else {
         return container;
@@ -814,165 +941,221 @@
       var makePalette = function(){
         var palette = new Map();
         return function(n){
-          if(highlightMode == "scsh" || highlightMode == "scmh")
-            return 0;
-          if(!palette.has(n)) {
-            lastHue = (lastHue + goldenAngle)%(Math.PI*2.0);
-            palette.set(n, lastHue);
+          if(n === -1) {
+            return undefined;
+          } else {
+            if(highlightMode == "scsh" || highlightMode == "scmh")
+              return 0;
+            if(!palette.has(n)) {
+              lastHue = (lastHue + goldenAngle)%(Math.PI*2.0);
+              palette.set(n, lastHue);
+            }
+            return palette.get(n);
           }
-          return palette.get(n);
         };};
 
       var palette = makePalette();
       var snippets = new Array();
       var highlights = new Map();
+         
       function help(errorDisp, stack) {
         return ffi.cases(get(ED, "is-ErrorDisplay"), "ErrorDisplay", errorDisp, {
           "v-sequence": function(seq) {
             var result = $("<div>");
             var contents = ffi.toArray(seq);
-            for (var i = 0; i < contents.length; i++) {
-              if (i != 0) result.append($("<br>"));
-              result.append(help(contents[i], stack));
-            }
-            return result;
+            return runtime.safeCall(function() {
+              return runtime.eachLoop(runtime.makeFunction(function(i) {
+                if (i != 0) result.append($("<br>"));
+                return runtime.safeCall(function() {
+                  return help(contents[i], stack);
+                }, function(helpContents) {
+                  result.append(helpContents);
+                  return runtime.nothing;
+                }, "help(contents[i])");
+              }), 0, contents.length);
+            }, function(_) { return result; }, "v-sequence: each: contents");
           },
           "bulleted-sequence": function(seq) {
-            return $("<ul>").append(ffi.toArray(seq).map(
-              function(i){
-                return $("<li>").append(help(i, stack));
-              }));
+            var contents = ffi.toArray(seq);
+            var result = $("<ul>");
+            return runtime.safeCall(function() {
+              return runtime.eachLoop(runtime.makeFunction(function(i) {
+                return runtime.safeCall(function() { 
+                  return help(contents[i], stack); 
+                }, function(helpContents) {
+                  result.append($("<li>").append(helpContents));
+                  return runtime.nothing;
+                }, "help(contents[i])");
+              }), 0, contents.length)
+            }, function(_) { return result; }, "bulleted-sequence: each: contents");
           },
           "h-sequence": function(seq, separator) {
             var result = $("<p>");
             var contents = ffi.toArray(seq);
-            for (var i = 0; i < contents.length; i++) {
-              if (i != 0 && separator !== "") result.append(separator);
-              result.append(help(contents[i], stack));
-            }
-            return result.contents();
+            return runtime.safeCall(function() {
+              return runtime.eachLoop(runtime.makeFunction(function(i) { 
+                if (i != 0 && separator !== "") result.append(separator);
+                return runtime.safeCall(function() {
+                  return help(contents[i], stack);
+                }, function(helpContents) { 
+                  result.append(helpContents);
+                  return runtime.nothing;
+                }, "help(contents[i])");
+              }), 0, contents.length);
+            }, function(_) { return result.contents(); }, "h-sequence: each: contents");
           },
           "paragraph": function(seq) {
             var result = $("<p>");
             var contents = ffi.toArray(seq);
-            for (var i = 0; i < contents.length; i++) {
-              result.append(help(contents[i], stack));
-            }
-            return result;
+            return runtime.safeCall(function() {
+              return runtime.eachLoop(runtime.makeFunction(function(i) {
+                return runtime.safeCall(function() { 
+                  return help(contents[i], stack);
+                }, function(helpContents) {
+                  result.append(helpContents);
+                  return runtime.nothing;
+                }, "help(contents[i])");
+              }), 0, contents.length);
+            }, function(_) { return result; }, "paragraph: each: contents");
           },
           "embed": function(val) {
-            var placeholder = $("<span>").text("Rendering...");
-            var replace = function(replacement) {
-              if ($.contains(document.documentElement, placeholder[0])) {
-                placeholder.replaceWith(replacement);
-              } else {
-                placeholder = replacement;
-              }
-            }
-            var tryTorepr = function() { return runtime.toReprJS(val, runtime.ReprMethods["$cpo"]); }
-            var processTryTorepr = function(out) {
-              var replacement;
-              if (runtime.isSuccessResult(out)) {
-                replacement = out.result;
-              } else {
-                replacement = $("<span>").addClass("output-failed")
-                  .text("<error rendering embedded value; details logged to console>");
-                console.error(out.exn);
-              }
-              replace(replacement);
-              return placeholder;
-            }
-            var tryRenderReason = function() {
-              return runtime.getField(val, "render-fancy-reason").app(
-                locToAST(runtime, editors, srcloc),
-                locToSrc(runtime, editors, srcloc));};
-            var processTryRenderReason = function(out) {
-              if (runtime.isSuccessResult(out)) {
-                var replacement = help(out.result, stack);
-                $(replacement).addClass("compile-error");
-                replace(replacement);
-              } else {
-                runtime.runThunk(tryTorepr, processTryTorepr);
-              }
-              return placeholder;
-            }
-
             if (runtime.isPyretException(val.val)) {
               var e = val.val;
+              var maybeStackLoc   = makeMaybeStackLoc(runtime, editors, srcloc, e.pyretStack);
+              var srclocAvaliable = makeSrclocAvaliable(runtime, editors, srcloc);
+              var maybeLocToAST   = makeMaybeLocToAST(runtime, editors, srcloc);
               var container = $("<div>").addClass("compile-error");
-              runtime.runThunk(
-                function() { return get(e.exn, "render-fancy-reason").app(
-                  locToAST(runtime, editors, srcloc),
-                  locToSrc(runtime, editors, srcloc));},
-                function(errorDisp) {
+              runtime.pauseStack(function(restarter) {
+                runtime.runThunk(function() {
+                  return runtime.getField(e.exn, "render-fancy-reason").app(
+                    maybeStackLoc,
+                    srclocAvaliable,
+                    maybeLocToAST);
+                }, function(errorDisp) {
                   if (runtime.isSuccessResult(errorDisp)) {
-                    var highlightLoc = getLastUserLocation(runtime, srcloc, e.pyretStack,
-                      e.exn.$name == "arity-mismatch" ? 1
-                                                      : 0);
-                    if(highlightMode === "scsh" && highlightLoc != undefined) {
-                      highlightSrcloc(runtime, editors, srcloc, highlightLoc, "hsl(0, 100%, 89%);", context);
-                    }
-                    container = help(errorDisp.result, e.pyretStack)
-                                  .addClass("compile-error");
-                    container.append(renderStackTrace(runtime,editors, srcloc, e));
+                    var highlightLoc = getLastUserLocation(runtime, srcloc, editors, e.pyretStack,
+                                                           e.exn.$name == "arity-mismatch" ? 1
+                                                           : 0, true);
+                    runtime.runThunk(function() {
+                      return runtime.safeCall(function() {
+                        if(highlightMode === "scsh" && highlightLoc != undefined) {
+                          highlightSrcloc(runtime, editors, srcloc, highlightLoc, 
+                                          "hsl(0, 100%, 89%);", context);
+                        }
+                        return null;
+                      }, function(_) {
+                        return help(errorDisp.result, e.pyretStack);
+                      }, "highlightSrcloc, then help");
+                    }, function(containerResult) {
+                      if (runtime.isSuccessResult(containerResult)) {
+                        var container = containerResult.result;
+                        if (container.length > 0) {
+                          container = $("<div>").append(container);
+                        }
+                        container.addClass("compile-error");
+                        container.append(renderStackTrace(runtime,editors, srcloc, e));
+                        restarter.resume(container);
+                      } else {
+                        container.add($("<span>").addClass("output-failed")
+                                      .text("<error rendering reason for exception; details logged to console>"));
+                        console.error("help: embed: highlightSrcloc or help failed:", errorDisp);
+                        console.log(errorDisp.exn);
+                        restarter.resume(container);
+                      }
+                    });
                   } else {
-                      console.log(errorDisp.exn);
+                    container.add($("<span>").addClass("output-failed")
+                                  .text("<error rendering fancy-reason of exception; details logged to console>"));
+                    console.error("help: embed: render-fancy-reason failed:", errorDisp);
+                    console.log(errorDisp.exn);
+                    restarter.resume(container);
                   }
                 });
-              replace(container);
-              return placeholder;
+              });
             } else {
-              runtime.runThunk(tryTorepr, processTryTorepr);
-              return placeholder;
+              runtime.pauseStack(function(restarter) {
+                runtime.runThunk(function() {
+                  return runtime.toReprJS(val, runtime.ReprMethods["$cpo"]);
+                }, function(out) {
+                  if (runtime.isSuccessResult(out)) {
+                    restarter.resume(out.result);
+                  } else {
+                    var result = $("<span>").addClass("output-failed")
+                      .text("<error rendering embedded value; details logged to console>");
+                    console.error(out.exn);
+                    restarter.resume(result);
+                  }
+                });
+              });
             }
           },
           "optional": function(contents) {
-            return expandableMore(help(contents, stack));
+            return runtime.safeCall(function() {
+              return help(contents, stack);
+            }, function(helpContents) {
+              return expandableMore(helpContents);
+            }, "optional: help(contents)");
           },
           "text": function(txt) {
             return $("<span>").text(txt);
           },
           "code": function(contents) {
-            return $("<code>").append(help(contents, stack));
+            return runtime.safeCall(function() {
+              return help(contents, stack);
+            }, function(helpContents) {
+              return $("<code>").append(helpContents);
+            }, "code: help(contents)");
           },
           "styled": function(contents, style) {
-            return help(contents, stack).addClass(style);
+            return runtime.safeCall(function() {
+              return help(contents, stack);
+            }, function(helpContents) {
+              return helpContents.addClass(style);
+            }, "styled: help(contents)");
           },
           "cmcode": function(loc) {
             var cmloc = cmPosFromSrcloc(runtime, srcloc, loc);
-            var s = snippet(editors, cmloc);
+            var s = snippet(editors, cmloc, srcloc, loc);
             snippets.push(s);
             return s.wrapper;
           },
           "maybe-stack-loc": function(n, userFramesOnly, contentsWithLoc, contentsWithoutLoc) {
             var probablyErrorLocation;
-            if (userFramesOnly) { probablyErrorLocation = getLastUserLocation(runtime, srcloc, stack, n); }
-            else if (stack.length >= n) { probablyErrorLocation = runtime.makeSrcloc(stack[n]); }
-            else { probablyErrorLocation = false; }
+            if (userFramesOnly) { 
+              probablyErrorLocation = getLastUserLocation(runtime, srcloc, editors, stack, n, false); 
+            } else if (stack.length >= n) { 
+              probablyErrorLocation = runtime.makeSrcloc(stack[n]); 
+            } else {
+              probablyErrorLocation = false; 
+            }
             if (probablyErrorLocation) {
-              var placeholder = $("<span>").text("Rendering...");
-              runtime.runThunk(
-                function() { return contentsWithLoc.app(probablyErrorLocation); },
-                function(out) {
+              runtime.pauseStack(function(restarter) {
+                runtime.runThunk(function() {
+                  return contentsWithLoc.app(probablyErrorLocation);
+                }, function(out) {
                   if (runtime.isSuccessResult(out)) {
-                    var rendered = help(out.result,stack);
-                    if ($.contains(document.documentElement, placeholder[0])) {
-                      placeholder.replaceWith(rendered);
-                    }
-                    else {
-                      placeholder = rendered;
-                    }
-                    return rendered;
+                    runtime.runThunk(function() { 
+                      return help(out.result, stack);
+                    }, function(helpOut) { 
+                      restarter.resume(helpOut.result); 
+                    });
                   } else {
-                    var msg = $("<span>").addClass("output-failed")
-                      .text("<error rendering embedded contents; details logged to console>");
-                    console.log(out.exn);
-                    return msg;
+                    runtime.runThunk(function() {
+                      return help(contentsWithoutLoc, stack);
+                    }, function(helpOut) { 
+                      var result = $("<div>");
+                      result.append($("<span>").addClass("error")
+                                    .text("<error displaying srcloc-specific message; "
+                                          + "details logged to console; " 
+                                          + "less-specific message displayed instead>"));
+                      result.append(helpOut.result);
+                      restarter.resume(result); 
+                    });
                   }
                 });
-              return placeholder;
-            } else {
-              return help(contentsWithoutLoc,stack);
+              });
+            } else {              
+              return help(contentsWithoutLoc, stack);
             }
           },
           "loc": function(loc) {
@@ -981,106 +1164,152 @@
           "highlight": function(contents, locs, color) {
             if(highlightMode == "scsh") return help(contents,stack);
 
-            var anchor = $("<a>").append(help(contents,stack)).addClass("highlight");
+            return runtime.safeCall(function () {
+              return help(contents, stack);
+            }, function(helpContents) {
+              var anchor = $("<a>").append(helpContents).addClass("highlight");
 
-            var locArray = ffi.toArray(locs);
-
-
-            anchor.attr('title',
-              "Click to scroll source location into view.");
-
-            var cmLocs = locArray.map(
-              function(l){return cmPosFromSrcloc(runtime, srcloc, l);});
-
-            var cssColor = hueToRGB(palette(locs));
-
-            var locClasses = cmLocs.map(
-              function(l){return cmlocToCSSClass(l);});
-
-            for (var h = 0; h < locArray.length; h++) {
-              anchor.addClass(locClasses[h]);
-              var highlight = highlights.get({pl:locArray[h],l:cmLocs[h],c:cssColor});
-              if(highlight == undefined) {
-                highlights.set({pl:locArray[h],l:cmLocs[h],c:palette(color)},
-                  highlightSrcloc(runtime, editors, srcloc, locArray[h], cssColor, context, true));
+              var isSrcloc = function(s) { return runtime.unwrap(runtime.getField(srcloc, "is-srcloc").app(s)); }
+              var locArray = ffi.toArray(locs).filter(function(l) { return l && isSrcloc(l); });
+              
+              anchor.attr('title',
+                          "Click to scroll source location into view.");
+              
+              var cmLocs = locArray.map(
+                function(l){return cmPosFromSrcloc(runtime, srcloc, l);});
+              
+              var hue = palette(color);
+              var cssColor = hue === undefined ? undefined : hueToRGB(hue);
+              
+              var locClasses = cmLocs.map(
+                function(l){return cmlocToCSSClass(l);});
+              
+              //for (var h = 0; h < locArray.length; h++) {
+              //  anchor.addClass(locClasses[h]);
+              //  var highlight = highlights.get({pl:locArray[h],l:cmLocs[h],c:cssColor});
+              //  if(highlight == undefined) {
+              //    highlights.set({pl:locArray[h],l:cmLocs[h],c:cssColor},
+              //      highlightSrcloc(runtime, editors, srcloc, locArray[h], cssColor, context, true));
+              //  }
+              //}
+              for (var h = 0; h < locArray.length; h++) {
+                anchor.addClass(locClasses[h]);
+                var highlight = highlights.get({pl: locArray[h], l: cmLocs[h], c: cssColor});
+                if(highlight == undefined) {
+                  highlights.set({pl: locArray[h], l: cmLocs[h], c: cssColor},
+                                 highlightSrcloc(runtime, editors, srcloc, locArray[h], cssColor, context, true));
+                }
               }
-            }
-
-            anchor.on("mouseenter", function() {
-              for (var i = 0; i < locClasses.length; i++) {
-                hintLoc(runtime, editors, srcloc, locArray[i]);
-                $("."+locClasses[i]).css("animation", "pulse 0.4s infinite alternate");
+              
+              if (hue === undefined) {
+                anchor.on("mouseenter", function() {
+                  for (var i = 0; i < locClasses.length; i++) {
+                    hintLoc(runtime, editors, srcloc, locArray[i]);
+                    $("."+locClasses[i]).css("animation", "pulse-underline 0.4s infinite alternate");
+                  }
+                });
+              } else {
+                anchor.on("mouseenter", function() {
+                  for (var i = 0; i < locClasses.length; i++) {
+                    hintLoc(runtime, editors, srcloc, locArray[i]);
+                    $("."+locClasses[i]).css("animation", "pulse 0.4s infinite alternate");
+                  }
+                });
               }
-            });
-
-            anchor.on("click", function() {
-              for (var z = 0; z < locClasses.length; z++) {
-                var cmloc = cmLocs[z];
-                var els = document.getElementsByClassName(locClasses[z]);
-                emphasizeLine(editors, cmloc);
-              }
-            });
-
-            anchor.on("mouseleave", function() {
-              for (var i = 0; i < locClasses.length; i++) {
-                unhintLoc(runtime, editors, srcloc, locArray[i]);
-                $("."+locClasses[i]).css("animation", "");
-              }
-            });
-
-            anchor.on("click", function() {
-              gotoLoc(runtime, editors, srcloc, locArray[0]);
-            });
-
-            return anchor;
+              
+              anchor.on("click", function() {
+                for (var z = 0; z < locClasses.length; z++) {
+                  var cmloc = cmLocs[z];
+                  var els = document.getElementsByClassName(locClasses[z]);
+                  emphasizeLine(editors, cmloc);
+                }
+              });
+              
+              anchor.on("mouseleave", function() {
+                for (var i = 0; i < locClasses.length; i++) {
+                  unhintLoc(runtime, editors, srcloc, locArray[i]);
+                  $("."+locClasses[i]).css("animation", "");
+                }
+              });
+              
+              anchor.on("click", function() {
+                gotoLoc(runtime, editors, srcloc, locArray[0]);
+              });
+              
+              return anchor;
+            }, "highlight: help(contents)");
           },
           "loc-display": function(loc, style, contents) {
-            var inner = help(contents,stack);
-            hoverLink(editors, runtime, srcloc, inner, loc, "error-highlight");
-            return inner;
+            return runtime.safeCall(function () {
+              return help(contents, stack);
+            }, function(inner) {
+              hoverLink(editors, runtime, srcloc, inner, loc, "error-highlight");
+              return inner;
+            }, "loc-display: help(contents)");
           }
         });
       }
-      var rendering = help(errorDisp, stack);
-
-      snippets.forEach(function(s){
-        highlights.forEach(function(value,key){
-            s.editor.markText(
-              {line: key.l.start.line - s.featured.start.line, ch: key.l.start.ch},
-              {line: key.l.end.line - s.featured.start.line, ch: key.l.end.ch},
-              {className:"highlight " + cmlocToCSSClass(key.l),
-               handleMouseEvents: false, atomic: true});
-            var updated = false;
-            s.editor.on("update", function() {
-              if(updated) return;
-              updated = true;
-              $(s.wrapper).find(".highlight." + cmlocToCSSClass(key.l)).on("mouseenter", function() {
-                hintLoc(runtime, editors, srcloc, key.pl);
-                $("."+cmlocToCSSClass(key.l)).css("animation", "pulse 0.4s infinite alternate");
+      
+      return runtime.safeCall(function() {
+        return help(errorDisp, stack);
+      }, function(rendering) {
+        if (rendering.length > 0) {
+          rendering = $("<div>").append(rendering);
+        }
+        snippets.forEach(function(s){
+          if (!s.editor) return;
+          s.editor.operation(function() {
+            highlights.forEach(function(value,key){
+              if(key.l.source != s.featured.source)
+                return;
+              var locKey = cmlocToCSSClass(key.l);
+              s.editor.markText(
+                {line: key.l.start.line - s.featured.start.line, ch: key.l.start.ch},
+                {line: key.l.end.line - s.featured.start.line, ch: key.l.end.ch},
+                {className:"highlight " + locKey,
+                 handleMouseEvents: false, atomic: true});
+              if(!editors[key.l.source]) {
+                var styles = document.getElementById("highlight-styles").sheet;
+                styles.insertRule(
+                  ((context === undefined) ? "" : "#main[data-highlights=" + context + "]")
+                    + " ." + locKey + " { " + (!!key.c ? "background-color:" + key.c : "")
+                    + ";border-bottom: 2px hsla(0, 0%, 0%,.5) solid;}",styles.cssRules.length);
+              };
+              if(!key.c)
+                return;
+              var updated = false;
+              s.editor.on("update", function() {
+                if(updated) return;
+                updated = true;
+                $(s.wrapper).find(".highlight." + cmlocToCSSClass(key.l)).on("mouseenter", function() {
+                  hintLoc(runtime, editors, srcloc, key.pl);
+                  $("."+cmlocToCSSClass(key.l)).css("animation", "pulse 0.4s infinite alternate");
+                });
+                $(s.wrapper).find(".highlight." + cmlocToCSSClass(key.l)).on("click", function() {
+                  emphasizeLine(editors, key.l);
+                  gotoLoc(runtime, editors, srcloc, key.pl);
+                });
+                $(s.wrapper).find(".highlight." + cmlocToCSSClass(key.l)).on("mouseleave", function() {
+                  unhintLoc(runtime, editors, srcloc, key.pl);
+                  $("."+cmlocToCSSClass(key.l)).css("animation", "");
+                });
               });
-              $(s.wrapper).find(".highlight." + cmlocToCSSClass(key.l)).on("click", function() {
-                emphasizeLine(editors, key.l);
-                gotoLoc(runtime, editors, srcloc, key.pl);
-              });
-              $(s.wrapper).find(".highlight." + cmlocToCSSClass(key.l)).on("mouseleave", function() {
-                unhintLoc(runtime, editors, srcloc, key.pl);
-                $("."+cmlocToCSSClass(key.l)).css("animation", "");
-              });});
-          })});
-
-
-      if(context === undefined) 
-        rendering.addClass("highlights-active");
-      else if(context != undefined) {
-        rendering.bind('toggleHighlight',function() {
-          $(".highlights-active").removeClass("highlights-active");
-          document.getElementById("main").dataset.highlights = context;
-          rendering.addClass("highlights-active");
+            });
+          });
         });
-      }
 
-      return rendering;
+        if(context === undefined) 
+          rendering.addClass("highlights-active");
+        else if(context != undefined) {
+          rendering.bind('toggleHighlight',function() {
+            $(".highlights-active").removeClass("highlights-active");
+            document.getElementById("main").dataset.highlights = context;
+            rendering.addClass("highlights-active");
+          });
+        }
 
+        return rendering;
+      }, "renderErrorDisplay: help(contents)");
     }
 
     // A function to use the class of a container to toggle
@@ -1123,16 +1352,28 @@
 
     function installRenderers(runtime) {
       if (!runtime.ReprMethods.createNewRenderer("$cpo", runtime.ReprMethods._torepr)) return;
+      function renderText(txt) {
+        var echo = $("<span>").addClass("replTextOutput");
+        echo.text(txt);
+        // setTimeout(function() {
+        //   CodeMirror.runMode(echo.text(), "pyret", echo[0]);
+        //   echo.addClass("cm-s-default");
+        // }, 0);
+        return echo;
+      };
+      function sooper(renderers, valType, val) {
+        return renderers.__proto__[valType](val);
+      }
       var renderers = runtime.ReprMethods["$cpo"];
       renderers["opaque"] = function renderPOpaque(val) {
         if (image.isImage(val.val)) {
           return renderers.renderImage(val.val);
         } else {
-          return renderers.renderText("opaque", val);
+          return renderText(sooper(renderers, "opaque", val));
         }
       };
       renderers["cyclic"] = function renderCyclic(val) {
-        return renderers.renderText("cyclic", val);
+        return renderText(sooper(renderers, "cyclic", val));
       };
       renderers.renderImage = function renderImage(img) {
         var container = $("<span>").addClass('replOutput');
@@ -1147,7 +1388,7 @@
           var scaleFactorX = 100 / realWidth;
           var scaleFactorY = 200 / realHeight;
           var scaleFactor = scaleFactorX < scaleFactorY ? scaleFactorX : scaleFactorY;
-          var scaled = runtime.imageLib.makeScaleImage(scaleFactor, scaleFactor, img);
+          var scaled = image.makeScaleImage(scaleFactor, scaleFactor, img);
           imageDom = scaled.toDomNode();
           container.append(imageDom);
           container.append($("<img>").attr("src", "/img/magnifier.gif").addClass("info-icon"));
@@ -1186,7 +1427,7 @@
           // This function returns three string values, numerals to
           // appear before the decimal point, numerals to appear
           // after, and numerals to be repeated.
-          var decimal = jsnums.toRepeatingDecimal(num.numerator(), num.denominator());
+          var decimal = jsnums.toRepeatingDecimal(num.numerator(), num.denominator(), runtime.NumberErrbacks);
           var decimalString = decimal[0].toString() + "." + decimal[1].toString();
 
           var outText = $("<span>").addClass("replToggle replTextOutput rationalNumber fraction")
@@ -1203,22 +1444,11 @@
 
           return outText;
         } else {
-          return renderers.renderText("number", num);
+          return renderText(sooper(renderers, "number", num));
         }
       };
-      renderers["nothing"] = function renderPNothing(val) {
-        return $("<span>").addClass("replTextOutput").text("nothing");
-      };
-      renderers.renderText = function renderText(valType, val) {
-        var echo = $("<span>").addClass("replTextOutput");
-        echo.text(renderers.__proto__[valType](val));
-        setTimeout(function() {
-          CodeMirror.runMode(echo.text(), "pyret", echo[0]);
-          echo.addClass("cm-s-default");
-        }, 0);
-        return echo;
-      };
-      renderers["boolean"] = function(val) { return renderers.renderText("boolean", val); };
+      renderers["nothing"] = function(val) { return renderText("nothing"); }
+      renderers["boolean"] = function(val) { return renderText(sooper(renderers, "boolean", val)); };
       renderers["string"] = function(val) {
         var outText = $("<span>").addClass("replTextOutput escaped");
         var escapedUnicode = '"' + replaceUnprintableStringChars(val, true) + '"';
@@ -1265,8 +1495,8 @@
         }
         return ret.join('');
       };
-      renderers["method"] = function(val) { return renderers.renderText("method", val); };
-      renderers["function"] = function(val) { return renderers.renderText("function", val); };
+      renderers["method"] = function(val) { return renderText("<method:" + val.name + ">"); };
+      renderers["function"] = function(val) { return renderText("<function:" + val.name + ">"); };
       renderers["render-array"] = function(top) {
         var container = $("<span>").addClass("replToggle replOutput");
         // inlining the code for the VSCollection case of helper() below, without having to create the extra array
@@ -1463,24 +1693,30 @@
     // extra events to happen for them to show up, we provide this as an
     // imperative API: the DOM node created will be appended to the output
     // and also returned
+    // NOTE: THIS MUST BE CALLED WHILE RUNNING ON runtime's STACK
     function renderPyretValue(output, runtime, answer) {
       installRenderers(runtime);
-      runtime.runThunk(function() {
-        return runtime.toReprJS(answer, runtime.ReprMethods["$cpo"]);
-      }, function(container) {
-        if(runtime.isSuccessResult(container)) {
-          $(output).append(container.result);
-        }
-        else {
-          $(output).append($("<span>").addClass("error").text("<error displaying value: details logged to console>"));
-          console.log(container.exn);
-        }
-        return container;
+      runtime.pauseStack(function(restarter) {
+        runtime.runThunk(function() {
+          return runtime.toReprJS(answer, runtime.ReprMethods["$cpo"]);
+        }, function(container) {
+          if(runtime.isSuccessResult(container)) {
+            $(output).append(container.result);
+          }
+          else {
+            $(output).append($("<span>").addClass("error").text("<error displaying value: details logged to console>"));
+            console.log(container.exn);
+          }
+          restarter.resume(container);
+        });
       });
     }
     return runtime.makeJSModuleReturn({
+      installRenderers: installRenderers,
       renderPyretValue: renderPyretValue,
       renderStackTrace: renderStackTrace,
+      addMark: addMark,
+      runMarks: runMarks,
       hoverLocs: hoverLocs,
       hoverLink: hoverLink,
       highlightSrcloc: highlightSrcloc,
@@ -1497,8 +1733,9 @@
       getLastUserLocation: getLastUserLocation,
       cssSanitize: cssSanitize,
       cmlocToCSSClass: cmlocToCSSClass,
-      locToAST: locToAST,
-      locToSrc: locToSrc,
+      makeMaybeLocToAST: makeMaybeLocToAST,
+      makeMaybeStackLoc: makeMaybeStackLoc,
+      makeSrclocAvaliable: makeSrclocAvaliable
     });
 
 

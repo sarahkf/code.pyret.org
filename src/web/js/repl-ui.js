@@ -60,7 +60,7 @@
       $(".repl").animate({
            scrollTop: output.height(),
          },
-         500
+         50
       );
     }
 
@@ -77,14 +77,15 @@
       var runtime = callingRuntime;
       var rr = resultRuntime;
       return function(result) {
-        console.log("Management/compile run stats:", JSON.stringify(result.stats));
-        if(callingRuntime.isFailureResult(result)) {
-          errorUI.drawError(output, editors, callingRuntime, result.exn, makeErrorContext);
-        }
-        else if(callingRuntime.isSuccessResult(result)) {
-          result = result.result;
-          ffi.cases(ffi.isEither, "is-Either", result,
-            {
+        var doneDisplay = Q.defer();
+        callingRuntime.runThunk(function() {
+          console.log("Full time including compile/load:", JSON.stringify(result.stats));
+          if(callingRuntime.isFailureResult(result)) {
+            return errorUI.drawError(output, editors, callingRuntime, result.exn, makeErrorContext);
+          }
+          else if(callingRuntime.isSuccessResult(result)) {
+            result = result.result;
+            ffi.cases(ffi.isEither, "is-Either", result, {
               left: function(compileResultErrors) {
                 closeAnimationIfOpen();
                 var errs = [];
@@ -92,41 +93,47 @@
                 results.forEach(function(r) {
                   errs = errs.concat(ffi.toArray(runtime.getField(r, "problems")));
                 });
-                errorUI.drawError(output, editors, runtime, {exn: errs}, makeErrorContext);
+                return errorUI.drawError(output, editors, runtime, {exn: errs}, makeErrorContext);
               },
               right: function(v) {
                 // TODO(joe): This is a place to consider which runtime level
                 // to use if we have separate compile/run runtimes.  I think
                 // that loadLib will be instantiated with callingRuntime, and
                 // I think that's correct.
-                var runResult = rr.getField(loadLib, "internal").getModuleResultResult(v);
-                console.log("Stats for running definitions:", JSON.stringify(runResult.stats));
-                if(rr.isSuccessResult(runResult)) {
-                  if(!isMain) {
-                    var answer = rr.getColonField(runResult.result, "answer");
-                    if(!rr.isNothing(answer)) {
-                      outputUI.renderPyretValue(output, rr, answer);
-                      scroll(output);
+                callingRuntime.pauseStack(function(restarter) {
+                  rr.runThunk(function() {
+                    var runResult = rr.getField(loadLib, "internal").getModuleResultResult(v);
+                    console.log("Time to run compiled program:", JSON.stringify(runResult.stats));
+                    if(rr.isSuccessResult(runResult)) {
+                      return rr.safeCall(function() {
+                        return checkUI.drawCheckResults(output, editors, rr, 
+                                                        runtime.getField(runResult.result, "checks"), 
+                                                        makeErrorContext);
+                      }, function(_) {
+                        outputPending.remove();
+                        outputPendingHidden = true;
+                        return true;
+                      }, "rr.drawCheckResults");
+                    } else {
+                      return errorUI.drawError(output, editors, rr, runResult.exn, makeErrorContext);
                     }
-                  }
-
-                  checkUI.drawCheckResults(output, editors, rr, runtime.getField(runResult.result, "checks"), makeErrorContext);
-                  scroll(output);
-                  return true;
-
-                } else {
-                  errorUI.drawError(output, editors, rr, runResult.exn, makeErrorContext);
-                }
+                  }, function(_) {
+                    restarter.resume(callingRuntime.nothing);
+                  });
+                });
               }
             });
-        }
-        else {
-          console.error("Bad result: ", result);
-          errorUI.drawError(output, editors, callingRuntime, ffi.makeMessageException("Got something other than a Pyret result when running the program: " + String(result)), makeErrorContext);
-        }
-        $(".check-block-error .cm-future-snippet").each(function(){this.cmrefresh();});
-        $(".compile-error .cm-future-snippet").each(function(){this.cmrefresh();});
-
+          }
+          else {
+            doneDisplay.reject("Error displaying output");
+            console.error("Bad result: ", result);
+            return errorUI.drawError(output, editors, callingRuntime, ffi.makeMessageException("Got something other than a Pyret result when running the program: " + String(result)), makeErrorContext);
+          }
+        }, function(_) {
+          doneDisplay.resolve("Done displaying output");
+          return callingRuntime.nothing;
+        });
+      return doneDisplay.promise;
       }
     }
 
@@ -184,6 +191,16 @@
       });
 
       var output = jQuery("<div id='output' class='cm-s-default'>");
+      var outputPending = jQuery("<span>").text("Gathering results...");
+      var outputPendingHidden = true;
+      function maybeShowOutputPending() {
+        outputPendingHidden = false;
+        setTimeout(function() {
+          if(!outputPendingHidden) {
+            output.append(outputPending);
+          }
+        }, 200);
+      }
       runtime.setStdout(function(str) {
           ct_log(str);
           output.append($("<pre>").addClass("replPrint").text(str));
@@ -222,6 +239,8 @@
       var runContents;
       function afterRun(cm) {
         return function() {
+          outputPending.remove();
+          outputPendingHidden = true;
           options.runButton.empty();
           options.runButton.append(runContents);
           options.runButton.attr("disabled", false);
@@ -233,8 +252,11 @@
               cm.removeLineClass(line, 'background', 'cptteach-fixed');
             });
           }
-          output.get(0).scrollTop = output.get(0).scrollHeight;
+          //output.get(0).scrollTop = output.get(0).scrollHeight;
           showPrompt();
+          setTimeout(function(){
+            $("#output > .compile-error .cm-future-snippet").each(function(){this.cmrefresh();});
+          }, 200);
         }
       }
       function setWhileRunning() {
@@ -248,6 +270,34 @@
         options.runButton.attr("disabled", true);
       }
 
+      // SETUP FOR TRACING ALL OUTPUTS
+      var replOutputCount = 0;
+      outputUI.installRenderers(repl.runtime);
+      repl.runtime.setParam("onTrace", function(loc, val, url) {
+        if (repl.runtime.getParam("currentMainURL") !== url) { return { "onTrace": "didn't match" }; }
+        if (repl.runtime.isNothing(val)) { return { "onTrace": "was nothing" }; }
+        repl.runtime.pauseStack(function(restarter) {
+          repl.runtime.runThunk(function() {
+            return repl.runtime.toReprJS(val, repl.runtime.ReprMethods["$cpo"]);
+          }, function(container) {
+            if (repl.runtime.isSuccessResult(container)) {
+              $(output)
+                .append($("<div>").addClass("trace")
+                        .append($("<span>").addClass("trace").text("Trace #" + (++replOutputCount)))
+                        .append(container.result));
+              scroll(output);
+            } else {
+              $(output).append($("<div>").addClass("error trace")
+                               .append($("<span>").addClass("trace").text("Trace #" + (++replOutputCount)))
+                               .append($("<span>").text("<error displaying value: details logged to console>")));
+              console.log(container.exn);
+              scroll(output);
+            }
+            restarter.resume(val);
+          });
+        });
+      });
+
       var runMainCode = function(src, uiOptions) {
         breakButton.attr("disabled", false);
         output.empty();
@@ -257,9 +307,19 @@
 
         editors = {};
         editors["definitions://"] = uiOptions.cm;
+        function invalidateHighlights(cm, change) {
+          cm.off("change", invalidateHighlights);
+          document.getElementById("main").dataset.highlights = "";
+        }
+        editors["definitions://"].on("change", invalidateHighlights);
         interactionsCount = 0;
+        replOutputCount = 0;
         var replResult = repl.restartInteractions(src, !!uiOptions["type-check"]);
-        var doneRendering = replResult.then(displayResult(output, runtime, repl.runtime, true)).fail(function(err) {
+        var startRendering = replResult.then(function(r) {
+          maybeShowOutputPending();
+          return r;
+        });
+        var doneRendering = startRendering.then(displayResult(output, runtime, repl.runtime, true)).fail(function(err) {
           console.error("Error displaying result: ", err);
         });
         doneRendering.fin(afterRun(false));
@@ -285,7 +345,12 @@
         var thisName = 'interactions://' + interactionsCount;
         editors[thisName] = echoCM;
         var replResult = repl.run(code, thisName);
-        var doneRendering = replResult.then(displayResult(output, runtime, repl.runtime, false)).fail(function(err) {
+//        replResult.then(afterRun(CM));
+        var startRendering = replResult.then(function(r) {
+          maybeShowOutputPending();
+          return r;
+        });
+        var doneRendering = startRendering.then(displayResult(output, runtime, repl.runtime, false)).fail(function(err) {
           console.error("Error displaying result: ", err);
         });
         doneRendering.fin(afterRun(CM));
@@ -308,6 +373,8 @@
           }
         }
       }).cm;
+
+      editors['definitions://'] = CM;
 
       var lastNameRun = 'interactions';
       var lastEditorRun = null;

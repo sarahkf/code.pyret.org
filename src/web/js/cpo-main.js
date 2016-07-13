@@ -64,7 +64,6 @@
 
     var constructors = gdriveLocators.makeLocatorConstructors(storageAPI, runtime, compileLib, compileStructs, builtinModules);
 
-    var replEnv = gmf(compileStructs, "standard-builtins");
     function findModule(contextIgnored, dependency) {
       return runtime.safeCall(function() {
         return runtime.ffi.cases(gmf(compileStructs, "is-Dependency"), "Dependency", dependency,
@@ -116,7 +115,7 @@
           });
        }, function(l) {
           return gmf(compileLib, "located").app(l, runtime.nothing);
-       });
+       }, "findModule");
     }
 
     // NOTE(joe): This line is "cheating" by mixing runtime levels,
@@ -141,13 +140,15 @@
     });
     var builtinsForPyret = runtime.ffi.makeList(builtins);
 
+    var getDefsForPyret = runtime.makeFunction(function() {
+        return CPO.editor.cm.getValue();
+      });
+    var replGlobals = gmf(compileStructs, "standard-globals");
+
     var replP = Q.defer();
-    runtime.safeCall(function() {
+    return runtime.safeCall(function() {
         return gmf(cpo, "make-repl").app(
             builtinsForPyret,
-            runtime.makeFunction(function() {
-              return CPO.editor.cm.getValue();
-            }),
             pyRuntime,
             pyRealm,
             runtime.makeFunction(findModule));
@@ -158,7 +159,14 @@
             var ret = Q.defer();
             setTimeout(function() {
               runtime.runThunk(function() {
-                return gf(repl, "restart-interactions").app(typeCheck);
+                return runtime.safeCall(
+                  function() {
+                    return gf(repl,
+                    "make-definitions-locator").app(getDefsForPyret, replGlobals);
+                  },
+                  function(locator) {
+                    return gf(repl, "restart-interactions").app(locator, typeCheck);
+                  });
               }, function(result) {
                 ret.resolve(result);
               });
@@ -180,7 +188,7 @@
                   });
               }, function(result) {
                 ret.resolve(result);
-              });
+              }, "make-interaction-locator");
             }, 0);
             return ret.promise;
           },
@@ -195,7 +203,7 @@
           runtime: runtime
         };
         return withRepl(jsRepl);
-      });
+      }, "make-repl");
 
     function withRepl(repl) {
 
@@ -249,26 +257,25 @@
         doRunAction(editor.cm.getValue());
         $("#run-dropdown-content").hide();
       });
-
+      /*
       $("#select-scsh").click(function() {
         highlightMode = "scsh"; $("#run-dropdown-content").hide();});
       $("#select-scmh").click(function() {
         highlightMode = "scmh"; $("#run-dropdown-content").hide();});
       $("#select-mcmh").click(function() {
         highlightMode = "mcmh"; $("#run-dropdown-content").hide();});
-
+      */
       function doRunAction(src) {
-        editor.cm.clearGutter("CodeMirror-linenumbers");
-        var marks = editor.cm.getAllMarks();
-        document.getElementById("main").dataset.highlights = "";
-        editor.cm.eachLine(function(lh){
-          editor.cm.removeLineClass(lh, "background");});
-        for(var i = 0; i < marks.length; i++) {
-          marks[i].clear();
-        }
-        for(var i = 0; i < editor.cm.widgets.length; i++) {
-          editor.cm.widgets[i].clear();
-        }
+        editor.cm.operation(function() {
+          editor.cm.clearGutter("test-marker-gutter");
+          var marks = editor.cm.getAllMarks();
+          document.getElementById("main").dataset.highlights = "";
+          editor.cm.eachLine(function(lh){
+            editor.cm.removeLineClass(lh, "background");});
+          for(var i = 0; i < marks.length; i++) {
+            marks[i].clear();
+          }
+        });
         var sheet = document.getElementById("highlight-styles").sheet;
         for(var i=0; i< sheet.cssRules.length; i++) {
           sheet.deleteRule(i);

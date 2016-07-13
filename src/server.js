@@ -54,6 +54,11 @@ function start(config, onServerReady) {
     res.set("Content-Type", "application/javascript");
     res.send(fs.readFileSync("build/web/js/pyret.js.gz"));
   });
+  app.get("/js/cpo-main.jarr.gz.js", function(req, res) {
+    res.set("Content-Encoding", "gzip");
+    res.set("Content-Type", "application/javascript");
+    res.send(fs.readFileSync("build/web/js/cpo-main.jarr.gz.js"));
+  });
 
   app.use(cookieSession({
     secret: config.sessionSecret,
@@ -70,6 +75,9 @@ function start(config, onServerReady) {
   app.set('view engine', 'html');
 
   app.use(express.static(__dirname + "/../build/web/"));
+  if(config.development) {
+    app.use(express.static(__dirname + "/../test-util/"));
+  }
 
   app.get("/close.html", function(_, res) { res.render("close.html"); });
 
@@ -252,14 +260,19 @@ function start(config, onServerReady) {
     var googleLink = decodeURIComponent(parsed.query.slice(0));
     var googleParsed = url.parse(googleLink);
     var gReq = request({url: googleLink, encoding: 'binary'}, function(error, imgResponse, body) {
-      var h = imgResponse.headers;
-      var ct = h['content-type']
-      if(ct.indexOf('image/') !== 0) {
-        response.status(400).send({type: "non-image", error: "Invalid image type " + ct});
-        return;
+      if(error) {
+        response.status(400).send({type: "image-load-failure", error: "Unable to load image " + String(error)});
       }
-      response.set('content-type', ct);
-      response.end(body, 'binary');
+      else {
+        var h = imgResponse.headers;
+        var ct = h['content-type']
+        if(ct.indexOf('image/') !== 0) {
+          response.status(400).send({type: "non-image", error: "Invalid image type " + ct});
+          return;
+        }
+        response.set('content-type', ct);
+        response.end(body, 'binary');
+      }
     });
   });
 

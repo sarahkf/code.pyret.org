@@ -1,12 +1,51 @@
 ({
   requires: [
     { "import-type": "builtin", "name": "image-lib" },
-    { "import-type": "builtin", "name": "world-lib" },
-    { "import-type": "builtin", "name": "string-dict" },
+    { "import-type": "builtin", "name": "world-lib" }
   ],
   nativeRequires: [],
-  provides: [],
-  theModule: function(runtime, namespace, uri, imageLibrary, rawJsworld, strDict) {
+  provides: {
+    shorthands: {
+      "WCOofA": ["tyapp", ["local", "WorldConfigOption"], [["tid", "a"]]],
+      "Image": { tag: "name",
+                 origin: { "import-type": "uri", uri: "builtin://image" },
+                 name: "Image" }
+    },
+    values: {
+      "big-bang": ["forall", ["a"], ["arrow", [["tid", "a"], ["List", "WCOofA"]], ["tid", "a"]]],
+      "on-tick": ["forall", ["a"],
+          ["arrow",
+             [["arrow", [ ["tid", "a"] ], ["tid", "a"]]],
+             "WCOofA"]],
+      "on-tick-n": ["forall", ["a"],
+          ["arrow",
+             [["arrow", [ ["tid", "a"], "Number" ], ["tid", "a"]]],
+             "WCOofA"]],
+      "on-mouse": ["forall", ["a"],
+          ["arrow",
+             [["arrow", [ ["tid", "a"], "Number", "Number", "String" ], ["tid", "a"]]],
+             "WCOofA"]],
+      "on-key": ["forall", ["a"],
+          ["arrow",
+             [["arrow", [ ["tid", "a"], "String" ], ["tid", "a"]]],
+             "WCOofA"]],
+      "to-draw": ["forall", ["a"],
+          ["arrow",
+             [["arrow", [ ["tid", "a"] ], "Image"]],
+             "WCOofA"]],
+      "stop-when": ["forall", ["a"],
+          ["arrow",
+             [["arrow", [ ["tid", "a"] ], "Boolean"]],
+             "WCOofA"]],
+      "is-world-config": ["arrow", [ "Any" ], "Boolean"],
+      "is-key-equal": ["arrow", [ "String", "String" ], "Boolean"]
+    },
+    aliases: {},
+    datatypes: {
+      "WorldConfigOption": ["data", "WorldConfigOption", ["a"], [], {}]
+    }
+  },
+  theModule: function(runtime, namespace, uri, imageLibrary, rawJsworld) {
     var isImage = imageLibrary.isImage;
 
     //////////////////////////////////////////////////////////////////////
@@ -102,7 +141,7 @@
 
 
     // adaptWorldFunction: Racket-function -> World-CPS
-    // Takes a racket function and converts it to the CPS-style function
+    // Takes a pyret function and converts it to the CPS-style function
     // that our world implementation expects.
     // NOTE(joe):  This expects there to be no active run for runtime
     // (it should be paused).  The run gets paused by pauseStack() in the
@@ -115,7 +154,13 @@
         // any other nested function's args
         var pyretArgs = [].slice.call(arguments, 0, arguments.length - 1);
         runtime.run(function(_, _) {
-          return worldFunction.app.apply(null, pyretArgs);
+          // NOTE(joe): adding safecall here to get some meaningful caller frame
+          // so error messages know where the call is coming from
+          return runtime.safeCall(function() {
+            return worldFunction.app.apply(null, pyretArgs);
+          }, function(result) {
+            return result;
+          }, "big-bang");
         }, runtime.namespace,
                     { sync: false },
                     function(result) {
@@ -405,7 +450,7 @@
             runtime.ffi.checkArity(2, arguments, "on-tick-n");
             runtime.checkFunction(handler);
             runtime.checkNumber(n);
-            var fixN = typeof n === "number" ? fixN : n.toFixnum();
+            var fixN = typeof n === "number" ? n : n.toFixnum();
             return runtime.makeOpaque(new OnTick(handler, fixN * 1000));
           }),
           "to-draw": makeFunction(function(drawer) {

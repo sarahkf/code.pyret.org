@@ -11,10 +11,10 @@ em {
   position: fixed;
   right: 0;
   bottom: 10px;
-  width: 50px;
-  height: 50px%;
+  width: 50%;
+  height: 100%;
   z-index: 8700;
-  background: url('/img/pyret-spin.gif') 50% 0 no-repeat rgba(249, 249, 249, 0.5);
+  background: url('/img/pyret-spin.gif') 50% 30% no-repeat rgba(249, 249, 249, 0.5);
   background-size: 50px 50px;
 }
 
@@ -323,4 +323,10 @@ code {
 .copy-link {
   text-decoration: none;
   padding-left: 3px;
+}
+
+#run-dropdown-content sup {
+  font-size: 65%;
+  top: -.15em;
+  vertical-align: top;
 }

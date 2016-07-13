@@ -19,7 +19,7 @@ window.ct_error = function(/* varargs */) {
 var initialParams = url.parse(document.location.href);
 var params = url.parse("/?" + initialParams["hash"]);
 window.highlightMode = "mcmh"; // what is this for?
-function clearFlash() {
+window.clearFlash = function() {
   $(".notificationArea").empty();
 }
 window.stickError = function(message, more) {
@@ -113,7 +113,7 @@ $(function() {
       matchBrackets: true,
       styleSelectedText: true,
       foldGutter: true,
-      gutters: ["CodeMirror-linenumbers", "CodeMirror-foldgutter"],
+      gutters: ["CodeMirror-linenumbers", "test-marker-gutter"],
       lineWrapping: true
     };
 
@@ -132,8 +132,6 @@ $(function() {
       lowerWarning.append(lowerArrow);
       CM.display.wrapper.appendChild(lowerWarning.get(0));
     }
-
-    CM.widgets = new Array();
 
     return {
       cm: CM,
